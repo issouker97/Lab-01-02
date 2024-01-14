@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+import rospy
+from geometry_msgs.msg import Twist, Pose2D
+from sensor_msgs.msg import Range
+from nav_msgs.msg import Odometry
+from tf.transformations import euler_from_quaternion
+
+from evry_project_plugins.srv import DistanceToFlag
+
+# Class to implement a PID controller
+class PIDController:
+    def __init__(self, kp, ki, kd):
+        # PID gains
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        # Initialize previous error and integral components
+        self.prev_error = 0.0
+        self.integral = 0.0
+
+    # Method to calculate PID output based on current error
+    def calculate(self, error):
+        # Update integral term
+        self.integral += error
+        # Calculate derivative term
+        derivative = error - self.prev_error
+        # Calculate PID output
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        # Update previous error for the next iteration
+        self.prev_error = error
+        return output
+
+# Class representing a robot
+class Robot:
+    def __init__(self, robot_name):
+        # Robot attributes
+        self.speed = 0.0
+        self.angle = 0.0
+        self.sonar = 0.0
+        self.x, self.y = 0.0, 0.0
+        self.yaw = 0.0
+        self.robot_name = robot_name
+
+        # Subscribers and publisher
+        rospy.Subscriber(self.robot_name + "/sensor/sonar_front",
+                         Range, self.callbackSonar)
+        rospy.Subscriber(self.robot_name + "/odom",
+                         Odometry, self.callbackPose)
+        self.cmd_vel_pub = rospy.Publisher(
+            self.robot_name + "/cmd_vel", Twist, queue_size=1)
+
+    # Callback for the front sonar sensor
+    def callbackSonar(self, msg):
+        self.sonar = msg.range
+
+    # Method to get the sonar distance
+    def get_sonar(self):
+        return self.sonar
+
+    # Callback for the robot's pose
+    def callbackPose(self, msg):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        quaternion = msg.pose.pose.orientation
+        quaternion_list = [quaternion.x,
+                           quaternion.y, quaternion.z, quaternion.w]
+        roll, pitch, yaw = euler_from_quaternion(quaternion_list)
+        self.yaw = yaw
+
+    # Method to get the robot's pose
+    def get_robot_pose(self):
+        return self.x, self.y, self.yaw
+
+    # Method to constrain a value within a specified range
+    def constraint(self, val, min=-2.0, max=2.0):
+        if val < min:
+            return min
+        if val > max:
+            return max
+        return val
+
+    # Method to set the robot's speed and angle
+    def set_speed_angle(self, linear, angular):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = self.constraint(linear)
+        cmd_vel.angular.z = self.constraint(angular, min=-1, max=1)
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    # Method to get the distance to the flag using a service
+    def getDistanceToFlag(self):
+        rospy.wait_for_service('/distanceToFlag')
+        try:
+            service = rospy.ServiceProxy('/distanceToFlag', DistanceToFlag)
+            pose = Pose2D()
+            pose.x = self.x
+            pose.y = self.y
+            result = service(pose, int(self.robot_name[-1]))
+            return result.distance
+        except rospy.ServiceException as e:
+            print("Service call failed: %s" % e)
+
+
+def run_demo():
+    # Initialize ROS node and create Robot instance
+    rospy.init_node("Controller", anonymous=True)
+    robot_name = rospy.get_param("~robot_name")
+    robot = Robot(robot_name)
+    print(f"Robot : {robot_name} is starting..")
+    
+    # Strategy
+
+    # PID controller gains
+    kp = 10.0
+    ki = 0.1
+    kd = 0.01
+
+    # Create PID controller instance
+    pid_controller = PIDController(kp, ki, kd)
+
+    # Target distance to the flag and speed control parameters
+    target_distance = 1.0
+    max_speed = 2.0
+    min_speed = 0.5  #  the minimum desired speed adjustable
+    change_speed_distance = 5.0  # Adjust this value for the distance to start decelerating
+
+
+    # Main control loop
+    while not rospy.is_shutdown():
+        
+        distance = float(robot.getDistanceToFlag())
+
+        # changing velocity based on distance
+        if distance > change_speed_distance:
+            velocity = max_speed  # Keep maximum speed
+        else:
+            velocity = min_speed  # Decrease speed when closer to the target
+
+        angle = 0  
+
+        # Set the robot's speed and angle
+        robot.set_speed_angle(velocity, angle)
+        rospy.sleep(0.5)
+
+        # Print information about the distance to the flag and the velocity
+        print(f"{robot_name} distance to flag = {distance:.2f}, velocity = {velocity:.2f}")
+
+        # Check if the robot reached the flag and stop if needed
+        if distance <= target_distance:
+            print(f"{robot_name} reached the flag. Stopping...")
+            robot.set_speed_angle(0.0, 0.0)  # Set velocity and angle to zero
+            rospy.sleep(2.0)  # Wait for the robot to come to a complete stop
+            break
+
+    # Finishing by publishing the desired speed.
+    # DO NOT TOUCH.
+
+if __name__ == "__main__":
+    print("Running ROS..")
+    run_demo()

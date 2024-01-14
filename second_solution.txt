@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import rospy
+from geometry_msgs.msg import Twist, Pose2D
+from sensor_msgs.msg import Range
+from nav_msgs.msg import Odometry
+from tf.transformations import euler_from_quaternion
+from evry_project_plugins.srv import DistanceToFlag
+from std_msgs.msg import Empty
+from math import pi, sqrt, atan2, cos, sin
+import numpy as np
+from numpy import linalg as LA
+from geometry_msgs.msg import Twist, Pose2D, PoseStamped
+from sensor_msgs.msg import Range
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Empty
+
+
+class Robot:
+    def __init__(self, robot_name):
+        """Constructor of the class Robot
+        The required publishers / subscribers are created.
+        The attributes of the class are initialized
+
+        Args:
+            robot_name (str): Name of the robot, like robot_1, robot_2 etc. To be used for your subscriber and publisher with the robot itself
+        """
+        self.speed = 0.0
+        self.angle = 0.0
+        self.sonar = 0.0 #Sonar distance
+        self.x, self.y = 0.0, 0.0   #coordinates of the robot
+        self.yaw = 0.0  #yaw angle of the robot
+        self.robot_name = robot_name
+        self.trajectory = list()
+
+        '''Listener and publisher'''
+
+        rospy.Subscriber(self.robot_name + "/sensor/sonar_front", Range, self.callbackSonar)
+        rospy.Subscriber(self.robot_name + "/odom", Odometry, self.callbackPose)
+        self.cmd_vel_pub = rospy.Publisher(self.robot_name + "/cmd_vel", Twist, queue_size = 1)
+        
+        # Create a publisher for the trajectory path
+        self.path_pub = rospy.Publisher(self.robot_name + "/path", Path, queue_size=10)
+
+    
+    def publish_trajectory_point(self):
+        # Publish the current position as a trajectory point
+        pose_stamped = PoseStamped()
+        pose_stamped.header.frame_id = "map"  # Set the frame ID appropriately
+        pose_stamped.header.stamp = rospy.Time.now()
+        pose_stamped.pose.position.x, pose_stamped.pose.position.y, _ = self.get_robot_pose()
+        self.path_pub.publish(Path(header=pose_stamped.header, poses=[pose_stamped]))
+
+
+    def callbackSonar(self,msg):
+        """Callback function that gets the data coming from the ultrasonic sensor
+
+        Args:
+            msg (Range): Message that contains the distance separating the US sensor from a potential obstacle
+        """
+        self.sonar = msg.range
+
+
+    def get_sonar(self):
+        """Method that returns the distance separating the ultrasonic sensor from a potential obstacle
+        """
+        return self.sonar
+
+    def callbackPose(self, msg):
+        """Callback function that gets the data coming from the ultrasonic sensor
+
+        Args:
+            msg (Odometry): Message that contains the coordinates of the agent
+        """
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        quaternion = msg.pose.pose.orientation
+        quaternion_list = [quaternion.x, quaternion.y, quaternion.z, quaternion.w]
+        roll, pitch, yaw = euler_from_quaternion (quaternion_list)
+        self.yaw = yaw
+
+    def get_robot_pose(self):
+        """Method that returns the position and orientation of the robot"""
+        return self.x, self.y, self.yaw
+
+
+    def constraint(self, val, min=-2.0, max=2.0):
+        """Method that limits the linear and angular velocities sent to the robot
+
+        Args:
+            val (float): [Desired velocity to send
+            min (float, optional): Minimum velocity accepted. Defaults to -2.0.
+            max (float, optional): Maximum velocity accepted. Defaults to 2.0.
+
+        Returns:
+            float: Limited velocity whose value is within the range [min; max]
+        """
+        #DO NOT TOUCH
+        if val < min: return min
+        if val > max: return max
+        return val
+
+
+    def set_speed_angle(self,linear,angular):
+        """Method that publishes the proper linear and angular velocities commands on the related topic to move the robot
+
+        Args:
+            linear (float): desired linear velocity
+            angular (float): desired angular velocity
+        """
+        
+        cmd_vel = Twist()
+        cmd_vel.linear.x = self.constraint(linear)
+        cmd_vel.angular.z = self.constraint(angular, min=-1, max=1)
+        self.cmd_vel_pub.publish(cmd_vel)
+
+
+    def getDistanceToFlag(self):
+        """Get the distance separating the agent from a flag. The service 'distanceToFlag' is called for this purpose.
+        The current position of the robot and its id should be specified. The id of the robot corresponds to the id of the flag it should reach
+
+
+        Returns:
+            float: the distance separating the robot from the flag
+        """
+        rospy.wait_for_service('/distanceToFlag')
+        try:
+            service = rospy.ServiceProxy('/distanceToFlag', DistanceToFlag)
+            pose = Pose2D()
+            pose.x = self.x
+            pose.y = self.y
+            result = service(pose, int(self.robot_name[-1]))    #int(robot_name[-1]) corresponds to the id of the robot. It is also the id of the related flag
+            return result.distance
+        except rospy.ServiceException as e :
+            print("Service call failed: %s"%e)
+    
+
+    def get_polynomial_time_scaling_3rd_order(self,pos_start, velocity_start, pos_final, velocity_final, T):
+        # input: pos: position  of start/final point
+        #        velocity: of start/final point
+        #        T: the desired time to complete the trajectory in second
+        M= np.array([[0,0,0,1],[T**3 ,T**2 ,T ,1],[0, 0 ,1, 0],[3*T**2 ,2*T ,1, 0]])
+        Mt = M.transpose()
+        X = np.array([pos_start,velocity_start,pos_final,velocity_final])
+        [a,b,c,d] = Mt.dot(X) 
+        # output: the coefficients of this polynomial
+        return a, b, c, d
+
+def run_demo():
+    """Main loop"""
+    robot_name = rospy.get_param("~robot_name")
+    robot = Robot(robot_name)
+    print(f"Robot : {robot_name} is starting..")
+
+    # Strategy 2
+    PI = 3.141592654
+    # Tunning parameters for more effectivenss 
+    angular_gain = 0.4 # based on adjustement 
+    linear_gain = 0.8   #  based on adjustement
+    angleTolerance = 0.1 #  adjustable
+    
+    #polynomial coefficients 
+    if(robot.robot_name=='robot_1'):
+        x_a,x_b,x_c,x_d = robot.get_polynomial_time_scaling_3rd_order(robot.x,2,-21.21320344,0,0.5) # robot1 pos x, max speed, x pos of flag_1, min speed, T
+        y_a,y_b,y_c,y_d = robot.get_polynomial_time_scaling_3rd_order(robot.y,2,21.21320344,0,0.5)  # robot1 pos y, max speed, y pos of flag_1, min speed, T
+        angle_robot = 0.1
+    elif(robot.robot_name=='robot_2'):
+        x_a,x_b,x_c,x_d = robot.get_polynomial_time_scaling_3rd_order(robot.x,2,21.21320344,0,0.5) # robot2 pos x, max speed, x pos of flag_2, min speed, T
+        y_a,y_b,y_c,y_d = robot.get_polynomial_time_scaling_3rd_order(robot.y,2,21.21320344,0,0.5) # robot2 pos y, max speed, y pos of flag_2, min speed, T
+        angle_robot = -0.002
+    else :
+        x_a,x_b,x_c,x_d = robot.get_polynomial_time_scaling_3rd_order(robot.x,2,0,0,0.5)  # robot3 pos x, max speed, x pos of flag_3, min speed, T
+        y_a,y_b,y_c,y_d = robot.get_polynomial_time_scaling_3rd_order(robot.y,2,-30,0,0.5)  #  robot3 pos y, max speed, y pos of flag_3, min speed, T
+        angle_robot = -0.12
+    t = 0
+    
+    while not rospy.is_shutdown():
+      
+        print(f"time :{t}")
+        print(f"Distance to flag robot {robot.robot_name}: {robot.getDistanceToFlag()}")
+        print(f"Distance sonor {robot.robot_name}:{robot.get_sonar()}")
+        sonar = float(robot.get_sonar())
+        distance = float(robot.getDistanceToFlag())
+        t = t+0.1
+         # the polynomial equations for position
+        X = x_a*t**3 + x_b*t**2 + x_c*t + x_d
+        Y = y_a*t**3 + y_b*t**2 + y_c*t + y_d
+         # The linear velocity computing 
+        dX = 3*x_a*t**2 + 2*x_b*t + x_c
+        dY = 3*y_a*t**2 + 2*y_b*t + y_c
+        velocity = sqrt(dX**2 + dY**2)
+        
+        deltaX = X - robot.x
+        deltaY = Y - robot.y
+        lamda = atan2(deltaY,deltaX)
+        heading_error = lamda - robot.yaw # error to adjust the robot's orientation toward the next point on the trajectory.
+        
+        if (distance < 2 ):
+            velocity = 0
+            angle = 0
+            robot.set_speed_angle(velocity,angle)
+        else :
+            if (heading_error > PI):
+                heading_error = heading_error - (2 * PI)
+            elif (heading_error < -PI):
+                heading_error = heading_error + (2 * PI)
+        
+            if (abs(heading_error)>angleTolerance):
+                Velocity = 0.0
+                angle = angular_gain* heading_error + angle_robot
+            else :
+                Velocity = linear_gain*distance
+                angle = angle_robot
+                robot.publish_trajectory_point()
+             # Display desired speed and angle
+        print(f"Desired Speed for {robot.robot_name}: {velocity}")
+        print(f"Desired Angle for {robot.robot_name}: {angle}")
+        
+        robot.set_speed_angle(velocity,angle)
+
+
+        #Finishing by publishing the desired speed. DO NOT TOUCH.
+
+           
+        rospy.sleep(0.5)
+
+
+
+if __name__ == "__main__":
+    print("Running ROS..")
+    rospy.init_node("Controller", anonymous = True)
+    run_demo()
+
+
+
+    
